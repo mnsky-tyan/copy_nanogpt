@@ -1,0 +1,20 @@
+# Ignore everything by default
+*
+
+# Always keep gitignore
+!.gitignore
+
+# Keep Python version (pyenv)
+!.python-version
+
+# Keep core scripts
+!configurator_copy.py
+!model_copy.py
+!sample_copy.py
+!train_copy.py
+!requirements.txt
+
+# Keep shakespeare preprocessing
+!shakespeare/
+!shakespeare/prepare_copy.py
+!shakespeare/prepare_eos.py
