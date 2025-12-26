@@ -74,18 +74,29 @@ else:
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
+
+# batch initialization
 start_ids = encode(start)
-# torch.long = int64
-# [None, ..,] add batch dimension: (T,) → (1, T)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device))[None, ...]
+x1 = torch.tensor(start_ids, dtype=torch.long, device=device)[None, :]  # (1, T)
+
+B = 4  # batch size you want
+x = x1.repeat(B, 1)  # (B, T)
 
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, eos_token_id=eos_id)
-            print(decode(y[0].tolist()))
-            print('---------------')
-
-
-
-
+            y, lengths = model.generate(
+                x,
+                max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                eos_token_id=eos_id,
+                return_eos=False,        # default, but explicit
+                return_lengths=True,     # default, but explicit
+                pad_token_id=eos_id      # optional; default is eos_id anyway if eos_token_id is set
+            )
+            print(f"=== sample {k} ===")
+            for b in range(y.size(0)):
+                seq = y[b, :lengths[b].item()].tolist()
+                print(decode(seq))
+                print('---------------')
