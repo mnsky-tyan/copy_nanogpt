@@ -331,49 +331,96 @@ class GPT(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_token_id=None):
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        eos_token_id: int | None = None,
+        return_eos: bool = False,
+        pad_token_id: int | None = None,
+        return_lengths: bool = True,
+    ):
+        assert idx.dim() == 2, f"idx must be (B,T), got shape {tuple(idx.shape)}"
+        B = idx.size(0)
+        device = idx.device
 
-        # must hit range(max_new_tokens) every time 
-        for _ in range(max_new_tokens):
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
 
-            # cut to the block_size, seeing the most recent tokens only
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-
-            # self() is calling forward pass
-            logits, _ = self(idx_cond)
-
-            # get rid of the time dimension since its not training
-            # higher temperature tends to cause logits to be closer, higher randomness of inference
-            logits = logits[:, -1, :] / temperature
-
-            if top_k is not None:
-
-                # min() to find the smallest between top_k and vocab_size, error handling
-                # output of torch.topk: (v, i) v is value of of the highest to lowest logits, i is the index
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-
-                # v[:, [-1]] checks for the smallest value within top_k
-                # logits[True] (boolena tensor, only in torch)
-                # and logits that are smaller than v[:, [-1]] are set to -inf
-                logits[logits < v[:, [-1]]] = -torch.inf
-
-            probs = F.softmax(logits, dim=-1)
-
-            # torch.multinomial is the sampling step 
-            idx_next = torch.multinomial(probs, num_samples=1)
-
-            # dim=1 is the T dimension
-            idx = torch.cat((idx, idx_next), dim=1)
-
-            if eos_token_id is not None and idx_next == eos_token_id:
-                break
-
+        # create eos tensor once (for torch.where)
+        eos = None
         if eos_token_id is not None:
-            eos_positions = (idx == eos_token_id).nonzero(as_tuple=False)
-            if len(eos_positions) > 0:
-                first_eos_idx = eos_positions[0, 1]
-                idx = idx[:, :first_eos_idx]
+            eos = torch.tensor(eos_token_id, device=device, dtype=idx.dtype)
 
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)      # (B, 1, vocab) in your forward when targets=None
+            logits = logits[:, -1, :]       # (B, vocab)
+
+            # choose next token
+            if temperature < 0:
+                raise ValueError("temperature must be >= 0")
+
+            if temperature == 0.0:
+                # greedy
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (B,1)
+            else:
+                logits = logits / temperature
+
+                if top_k is not None and top_k > 0:
+                    k = min(int(top_k), logits.size(-1))
+                    v, _ = torch.topk(logits, k)
+                    logits = logits.masked_fill(logits < v[:, [-1]], -torch.inf)
+
+                probs = F.softmax(logits, dim=-1)                      # (B,vocab)
+                idx_next = torch.multinomial(probs, num_samples=1)     # (B,1)
+
+            # force finished sequences to keep emitting eos (keeps shapes aligned)
+            if eos_token_id is not None:
+                idx_next = torch.where(finished[:, None], eos, idx_next)
+
+            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+
+            # update finished mask and early exit if all done
+            if eos_token_id is not None:
+                finished |= (idx_next.squeeze(1) == eos_token_id)
+                if finished.all().item():
+                    break
+
+        lengths = None
+
+        # Post-process: strip EOS unless return_eos=True
+        if eos_token_id is not None and not return_eos:
+            trimmed = []
+            lengths_list = []
+
+            for b in range(B):
+                seq = idx[b]  # (Ttotal,)
+                eos_pos = (seq == eos_token_id).nonzero(as_tuple=False)
+                if eos_pos.numel() > 0:
+                    cut = int(eos_pos[0].item())  # first EOS position
+                    seq = seq[:cut]               # exclude EOS
+                trimmed.append(seq)
+                lengths_list.append(seq.numel())
+
+            lengths = torch.tensor(lengths_list, device=device, dtype=torch.long)
+            max_len = int(lengths.max().item()) if B > 0 else idx.size(1)
+
+            if pad_token_id is None:
+                pad_token_id = eos_token_id  # common GPT-2 practice
+
+            out = idx.new_full((B, max_len), fill_value=int(pad_token_id))
+            for b, seq in enumerate(trimmed):
+                out[b, :seq.numel()] = seq
+            idx = out
+
+        else:
+            if return_lengths:
+                lengths = torch.full((B,), idx.size(1), device=device, dtype=torch.long)
+
+        if return_lengths:
+            return idx, lengths
         return idx
 
 # if __name__ == "__main__":
