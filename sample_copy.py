@@ -17,6 +17,10 @@ eos_id = tiktoken.get_encoding('gpt2').eot_token # None for always producing max
 max_new_tokens = 100
 temperature = 0.8
 top_k = 10
+top_p = 0.95
+min_new_tokens = 10
+return_eos = False
+return_lengths = True
 seed = 1337
 device = 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
@@ -90,10 +94,12 @@ with torch.no_grad():
                 max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
+                top_p=top_p,
+                min_new_tokens=min_new_tokens,
                 eos_token_id=eos_id,
-                return_eos=False,        # default, but explicit
-                return_lengths=True,     # default, but explicit
-                pad_token_id=eos_id      # optional; default is eos_id anyway if eos_token_id is set
+                return_eos=return_eos,        
+                return_lengths=return_lengths,     
+                pad_token_id=eos_id      
             )
             print(f"=== sample {k+1} ===")
             for b in range(y.size(0)):
