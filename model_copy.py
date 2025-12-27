@@ -337,70 +337,111 @@ class GPT(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float | None = None,
+        min_new_tokens: int = 0,
         eos_token_id: int | None = None,
         return_eos: bool = False,
         pad_token_id: int | None = None,
         return_lengths: bool = True,
     ):
+
         assert idx.dim() == 2, f"idx must be (B,T), got shape {tuple(idx.shape)}"
-        B = idx.size(0)
+        B, T = idx.size()
         device = idx.device
-
+        # finished is a boolean tensor of shape (B, )
         finished = torch.zeros(B, dtype=torch.bool, device=device)
+        # eos is a single number tensor, eos_token_id is an int
+        # create eos for torch.where()
+        eos = torch.tensor(eos_token_id, device=device, dtype=idx.dtype) if eos_token_id is not None else None
 
-        # create eos tensor once (for torch.where)
-        eos = None
-        if eos_token_id is not None:
-            eos = torch.tensor(eos_token_id, device=device, dtype=idx.dtype)
+        for step in range(max_new_tokens):
+            # slice it to block_size
+            idx_cond = idx[:, -self.config.block_size:]
+            # self() = forward pass
+            logits, _ = self(idx_cond)
+            # get the last token
+            logits = logits[:, -1, :]  # (B, vocab)
 
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond)      # (B, 1, vocab) in your forward when targets=None
-            logits = logits[:, -1, :]       # (B, vocab)
-
-            # choose next token
             if temperature < 0:
                 raise ValueError("temperature must be >= 0")
 
+            # Ban EOS before min_new_tokens
+            if eos_token_id is not None and step < min_new_tokens:
+                # fetch the index of eos_token_id
+                logits[:, eos_token_id] = -torch.inf
+
+            # Greedy sampling
             if temperature == 0.0:
-                # greedy
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (B,1)
+                # argmax returns the index of the max value
+                # dim=-1(column) means return the max value for each row(batch)
+                # keepdim=True returns (B, 1) instead of (B,)
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+
+            # Normal sampling
             else:
                 logits = logits / temperature
 
                 if top_k is not None and top_k > 0:
+                    # in case top_k is larger than the vocabulary size
                     k = min(int(top_k), logits.size(-1))
+                    # topk returns the k largest values and their indices
                     v, _ = torch.topk(logits, k)
+                    # mask out the values that are smaller than the k largest values
+                    # v[-1] is the smallest k, preserving the dimension
                     logits = logits.masked_fill(logits < v[:, [-1]], -torch.inf)
 
-                probs = F.softmax(logits, dim=-1)                      # (B,vocab)
-                idx_next = torch.multinomial(probs, num_samples=1)     # (B,1)
+                # apply top_p after some logits are masked by top_k
+                if top_p is not None:
+                    p = float(top_p)
+                    if not (0.0 < p <= 1.0):
+                        raise ValueError("top_p must be in (0, 1].")
 
-            # force finished sequences to keep emitting eos (keeps shapes aligned)
+                    # sort returns the sorted values and their indices for all the batches
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    
+                    # e.g. sorted_probs = [0.40, 0.25, 0.15], cumulative_probs = [0.40, 0.65, 0.80]
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                    # e.g. sorted_mask = [False, False, ..., True, True, ...]
+                    # allows cumsum exceed p once
+                    sorted_mask = (cumulative_probs - sorted_probs) > p
+
+                    # fallback, the index 0 token is always False
+                    # sorted_mask[..., 0] is an ellipsis, same as sorted_mask[:, 0] for 2d and [:, :, 0] for 3d
+                    sorted_mask[..., 0] = False
+
+                    # zeros_like() returns a tensor of the same shape and dtype as sorted_mask
+                    # .scatter(dim, index, src), index=place to write, src=value to write
+                    mask = torch.zeros_like(sorted_mask).scatter(-1, sorted_indices, sorted_mask)
+                    logits = logits.masked_fill(mask, -torch.inf)
+
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
             if eos_token_id is not None:
-                idx_next = torch.where(finished[:, None], eos, idx_next)
+                # if finished = True, idx_next = eos
+                idx_next = torch.where(finished.view(B, 1), eos, idx_next)
 
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+                # idx_next is (B, 1), squeeze it becomes (B,)
+                # if finished = False, check the condition until True, and |= keeps it True
+                finished |= (idx_next.view(B, ) == eos_token_id)
 
-            # update finished mask and early exit if all done
-            if eos_token_id is not None:
-                finished |= (idx_next.squeeze(1) == eos_token_id)
-                if finished.all().item():
-                    break
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            if eos_token_id is not None and finished.all().item():
+                break
 
         lengths = None
-
-        # Post-process: strip EOS unless return_eos=True
         if eos_token_id is not None and not return_eos:
             trimmed = []
             lengths_list = []
-
             for b in range(B):
-                seq = idx[b]  # (Ttotal,)
+                seq = idx[b]
                 eos_pos = (seq == eos_token_id).nonzero(as_tuple=False)
                 if eos_pos.numel() > 0:
-                    cut = int(eos_pos[0].item())  # first EOS position
-                    seq = seq[:cut]               # exclude EOS
+                    cut = int(eos_pos[0].item())
+                    seq = seq[:cut]
                 trimmed.append(seq)
                 lengths_list.append(seq.numel())
 
@@ -408,13 +449,12 @@ class GPT(nn.Module):
             max_len = int(lengths.max().item()) if B > 0 else idx.size(1)
 
             if pad_token_id is None:
-                pad_token_id = eos_token_id  # common GPT-2 practice
+                pad_token_id = eos_token_id
 
             out = idx.new_full((B, max_len), fill_value=int(pad_token_id))
             for b, seq in enumerate(trimmed):
                 out[b, :seq.numel()] = seq
             idx = out
-
         else:
             if return_lengths:
                 lengths = torch.full((B,), idx.size(1), device=device, dtype=torch.long)

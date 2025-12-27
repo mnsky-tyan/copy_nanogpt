@@ -68,7 +68,7 @@ if load_meta:
 else:
     print("No meta.pkl found, assuming GPT-2 encodings...")
     enc = tiktoken.get_encoding('gpt2')
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    encode = lambda s: enc.encode(s)
     decode = lambda l: enc.decode(l)
 
 if start.startswith('FILE:'):
@@ -95,7 +95,7 @@ with torch.no_grad():
                 return_lengths=True,     # default, but explicit
                 pad_token_id=eos_id      # optional; default is eos_id anyway if eos_token_id is set
             )
-            print(f"=== sample {k} ===")
+            print(f"=== sample {k+1} ===")
             for b in range(y.size(0)):
                 seq = y[b, :lengths[b].item()].tolist()
                 print(decode(seq))
