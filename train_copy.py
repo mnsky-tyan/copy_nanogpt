@@ -63,7 +63,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' 
 
 # data
-dataset = 'shakespeare'
+dataset = 'data'
 gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 batch_size = 1    # if gradient_accumulation_steps > 1, this is the micro-batch size(number of sequences per gpu)
 block_size = 128

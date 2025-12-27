@@ -14,7 +14,6 @@
 !train_copy.py
 !requirements.txt
 
-# Keep shakespeare preprocessing
-!shakespeare/
-!shakespeare/prepare_copy.py
-!shakespeare/prepare_eos.py
+# Keep data preprocessing
+!data/
+!data/prepare_eos.py
