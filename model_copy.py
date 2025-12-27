@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 # torch.nn.functional are the lowest level of python code, lower level codes are cuda and c++
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 
 # normalization, keep the scale , for stable and faster training 
@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         #         [  0.,   0.,   0.,   0.]])
 
         # NOTE: 
-        # manual apply of SDPA FIXME
+        # manual apply of SDPA
         # att = (q @ k.transpose(2, 3)) * (1.0 / math.sqrt(k.size(-1)))     output:(B, nh, T, T)
         # (T, hs) @ (hs, T) = (T, T) for each in every batch and every heads
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -torch.inf)
@@ -437,24 +437,34 @@ class GPT(nn.Module):
             trimmed = []
             lengths_list = []
             for b in range(B):
+                # look at the whole batch
                 seq = idx[b]
+                # .nonzero() returns the indices of non-zero values 
                 eos_pos = (seq == eos_token_id).nonzero(as_tuple=False)
                 if eos_pos.numel() > 0:
                     cut = int(eos_pos[0].item())
                     seq = seq[:cut]
+                    
+                # [tensor([...]), tensor([...]), tensor([...]), ...]
                 trimmed.append(seq)
                 lengths_list.append(seq.numel())
 
+            # torch.long = torch.int64
             lengths = torch.tensor(lengths_list, device=device, dtype=torch.long)
-            max_len = int(lengths.max().item()) if B > 0 else idx.size(1)
+            max_len = int(lengths.max().item())
 
             if pad_token_id is None:
                 pad_token_id = eos_token_id
 
+            # .new_full() returns a tensor of the same dtype and device as idx
             out = idx.new_full((B, max_len), fill_value=int(pad_token_id))
+
+            # write batch by batch to out
             for b, seq in enumerate(trimmed):
                 out[b, :seq.numel()] = seq
             idx = out
+
+        # returns a tensor length B with all values T, not meaningful
         else:
             if return_lengths:
                 lengths = torch.full((B,), idx.size(1), device=device, dtype=torch.long)

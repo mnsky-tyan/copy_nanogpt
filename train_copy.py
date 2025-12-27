@@ -49,7 +49,7 @@ from model_copy import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O 
-out_dir = 'out'  # the directory of the model saved
+out_dir = 'saved_model'  # the directory of the model saved
 eval_interval = 50
 log_interval = 1
 eval_iters = 10 # how many batches to average over in estimate_loss

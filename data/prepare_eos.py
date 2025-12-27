@@ -1,13 +1,18 @@
 """
 prepare_eos.py
 
-- Downloads tinyshakespeare input.txt (if missing)
-- Writes input_eos.txt (human-readable) with a visible EOS marker string AFTER sentence punctuation
-- Produces train.bin / val.bin from token ids where EOS is appended at the ID level
-  (no allowed_special needed)
-
-This avoids inserting "<|endoftext|>" into the text before encoding.
+Downloads Tiny Shakespeare (input.txt) if missing, tokenizes it with the GPT-2
+tiktoken encoder, and inserts the GPT-2 end-of-text token (enc.eot_token) after
+sentence-ending punctuation (. ! ?). Writes:
+- train.bin / val.bin: uint16 token-id streams split 90/10 for training
+- input_eos.txt: a human-readable copy with <|endoftext|> markers (inspection only)
 """
+
+# NOTE:
+# - encode(allowed_special= ) will read the allowed_special token as a single token from raw text
+# - eos/bos/pad tokens in tokenizer are special
+# - if encode_ordinary(), eos token will definitely not be intepreted as 50256 during encoding, but inferencing 50256 is allowed
+# - encode(allowed_special= ) exists for eos token but not always used, main use cases including <|assistant|>, <|system|>, <|user|>, etc.
 
 import os
 import re
@@ -16,7 +21,7 @@ import numpy as np
 import tiktoken
 
 
-def download_if_missing(path: str) -> None:
+def download_if_missing(path):
     if os.path.exists(path):
         return
     url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -25,7 +30,7 @@ def download_if_missing(path: str) -> None:
         f.write(requests.get(url, timeout=60).text)
 
 
-def main() -> None:
+def main():
     dir_path = os.path.dirname(__file__)
 
     input_txt = os.path.join(dir_path, "input.txt")
@@ -41,12 +46,6 @@ def main() -> None:
     enc = tiktoken.get_encoding("gpt2")
     eos_id = enc.eot_token
 
-    # ---------
-    # 1) Build token ids WITHOUT allowed_special
-    #    We split the raw text and append eos_id after sentence-ending punctuation.
-    # ---------
-    # This keeps punctuation tokens in the stream and inserts EOS right after them.
-    # re.split keeps delimiters if we capture them.
     parts = re.split(r"([.!?])", data)
 
     ids: list[int] = []
@@ -57,30 +56,19 @@ def main() -> None:
             continue
         buf += part
         if part in ".!?":
-            # encode text up to and including the punctuation
             ids.extend(enc.encode_ordinary(buf))
-            ids.append(eos_id)  # <-- EOS inserted at token-id level
+            ids.append(eos_id) 
             buf = ""
 
-    # leftover (if text doesn't end with punctuation)
     if buf:
         ids.extend(enc.encode_ordinary(buf))
 
-    # ---------
-    # 2) Write a human-readable input_eos.txt
-    #    This is ONLY for inspection. It is NOT used for encoding.
-    # ---------
-    # Use a marker that is easy to see and unlikely to appear in the dataset.
-    EOS_MARKER = "<|eos|>"
-    # Reconstruct text from tokens, then insert marker after punctuation in plain text.
-    # (This is just for readability; training uses `ids` above.)
+    EOS_MARKER = "<|endoftext|>" 
+
     data_with_marker = re.sub(r"([.!?])", r"\1" + EOS_MARKER, data)
     with open(input_eos_txt, "w", encoding="utf-8") as f:
         f.write(data_with_marker)
 
-    # ---------
-    # 3) Split ids into train/val and write .bin
-    # ---------
     split_idx = int(0.9 * len(ids))
     train_ids = np.array(ids[:split_idx], dtype=np.uint16)
     val_ids = np.array(ids[split_idx:], dtype=np.uint16)
@@ -96,3 +84,6 @@ def main() -> None:
     print(f"val.bin tokens:   {len(val_ids):,}")
     print(f"wrote: {train_bin}")
     print(f"wrote: {val_bin}")
+
+if __name__ == "__main__":
+    main()
