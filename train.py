@@ -44,7 +44,7 @@ from contextlib import nullcontext
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from model_copy import GPTConfig, GPT
+from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -100,7 +100,7 @@ compile = False # use PyTorch 2.0 to compile the model
 # -----------------------------------------------------------------------------
 # isinstance check for v
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator_copy.py').read()) # overrides from command line or config file
+exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
