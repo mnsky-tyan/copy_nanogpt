@@ -6,11 +6,11 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model_copy import GPTConfig, GPT
+from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out'
+out_dir = 'saved_model'
 start = '\n'
 num_samples = 10
 eos_id = tiktoken.get_encoding('gpt2').eot_token # None for always producing max_tokens
@@ -25,7 +25,7 @@ seed = 1337
 device = 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = False
-exec(open('configurator_copy.py').read()) # overrides from command line or config file
+exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)

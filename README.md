@@ -7,7 +7,6 @@ This repo is **for my own learning purposes**. I added comments and made increme
 ## Credits / Inspiration
 
 - Original inspiration and starting point: **NanoGPT** by Andrej Karpathy  
-  https://github.com/karpathy/nanoGPT
 
 I’m grateful to Karpathy for making NanoGPT available and easy to learn from.
 

@@ -9,12 +9,15 @@
 
 # Keep core scripts
 !README.md
-!configurator_copy.py
-!model_copy.py
-!sample_copy.py
-!train_copy.py
+!configurator.py
+!model.py
+!sample.py
+!train.py
+!chat.py
 !requirements.txt
 
 # Keep data preprocessing
 !data/
 !data/prepare_eos.py
+!saved_model/
+!inspect_ckpt.py
