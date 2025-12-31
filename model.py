@@ -3,11 +3,10 @@ import inspect
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-
 # torch.nn.functional are the lowest level of python code, lower level codes are cuda and c++
 import torch.nn.functional as F
 
-
+# NOTE: LayerNorm is unused in this model
 # normalization, keep the scale , for stable and faster training 
 # without: exploding gradients, activations, gradient descent becomes hard
 # activations: all the intermediate state of the input to output process
@@ -22,7 +21,7 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
     
     # calling model like model(x) or self(x) will by default use the forward method
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         
         # x = B*T*C
         # x_hat = (x[i] - mean)/(sqrt(variance + epsilon)) for each single number in c    # standardization 
@@ -32,6 +31,29 @@ class LayerNorm(nn.Module):
         # self.weight.shape is the dimension to apply normalization, accept single number or shape     
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
 
+# manually apply Root Mean Square Normalization, the better version is fused RMSNorm with module import on GPU
+class RMSNorm(nn.Module):
+    """RMSNorm with optional bias (bias is typically False in modern LLMs)."""
+
+    def __init__(self, config, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(config.n_embd))
+        self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C)
+        # rms = sqrt(mean(x^2) + eps) over the last dimension C
+        mean_square = x.pow(2).mean(dim=-1, keepdim=True)
+        inv_rms = torch.rsqrt(mean_square + self.eps)
+        x_norm = x * inv_rms
+
+        y = x_norm * self.weight  # broadcast over (B, T)
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+# Causal Self Attention with Rotary Position Embedding (RoPE)
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -55,6 +77,111 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.head_dim = config.n_embd // config.n_head
+
+        self.rope_base = config.rope_base
+
+        # register buffer is used to store tensors that are not trainable
+        # persistent=False means the buffer will not be saved in the checkpoint
+        self.register_buffer("rope_cos_cached", None, persistent=False)
+        self.register_buffer("rope_sin_cached", None, persistent=False)
+        self.rope_cache_len = 0
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        # x is a tensor of shape (B, nh, T, hs)
+        # rotation is done on the last dimension (hs)
+        
+        # x1 = x[..., ::2] means x1 = x[0], x[2], x[4], ...
+        # x2 = x[..., 1::2] means x2 = x[1], x[3], x[5], ...
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+
+        # input = [10, 11, 20, 21, 30, 31]
+        # output = [-11, 10, -21, 20, -31, 30]
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+    @staticmethod
+    def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """
+        Apply rotary embedding to x.
+        x: (B, nh, T, hs)
+        cos/sin: (1, 1, T, hs)
+        """
+
+        # standard rotation for (a, b)
+        # the return of _apply_rope is same as (a, b) = (acosθ − bsinθ, asinθ + bcosθ)
+        return (x * cos) + (CausalSelfAttention._rotate_half(x) * sin)
+
+    @staticmethod
+    def _build_rope_cache(
+        seq_len: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        base: float = 10000.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns cos, sin caches of shape (1, 1, T, head_dim).
+        head_dim must be even.
+        """
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
+
+        # seq_len: [0, 1, 2, ..., seq_len-1]
+        # intentionally compute in dtype=torch.float32 to prevent loss of accuracy
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+        # inv_freq: (head_dim/2,)
+        # the general magnitude of the rotation for each pair in hs, within the range 0, 1
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+
+        # freqs: (T, head_dim/2)
+        # torch.outer is for two 1d tensors (t, 1) @ (1, inv_freq)
+        freqs = torch.outer(t, inv_freq)
+
+        # expand to (T, head_dim) by interleaving
+        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)
+
+        cos = emb.cos()[None, None, :, :].to(dtype=dtype)  # (1,1,T,hd)
+        sin = emb.sin()[None, None, :, :].to(dtype=dtype)
+        return cos, sin
+
+    def _get_rope_cos_sin(
+        self,
+        T: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # rebuild if cache is missing, too short, wrong device, or wrong dtype
+        need_rebuild = (
+            self.rope_cos_cached is None
+            or self.rope_sin_cached is None
+            or self.rope_cache_len < T
+            or self.rope_cos_cached.device != device
+            or self.rope_sin_cached.device != device
+            or self.rope_cos_cached.dtype != dtype
+            or self.rope_sin_cached.dtype != dtype
+        )
+
+        if need_rebuild:
+            cos, sin = self._build_rope_cache(
+                seq_len=T,
+                head_dim=self.head_dim,
+                device=device,
+                dtype=dtype,
+                base=self.rope_base,
+            )
+
+            # Re-register so they remain proper buffers (and move with .to(), etc.)
+            # This overwrites the existing buffer entries with new tensors.
+            self.register_buffer("rope_cos_cached", cos, persistent=False)
+            self.register_buffer("rope_sin_cached", sin, persistent=False)
+            self.rope_cache_len = T
+
+        cos = self.rope_cos_cached[:, :, :T, :]
+        sin = self.rope_sin_cached[:, :, :T, :]
+        return cos, sin
 
     def forward(self, x):
         B, T, C = x.shape
@@ -64,9 +191,15 @@ class CausalSelfAttention(nn.Module):
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  
         
         # (B, n_head, T, head_size)
-        q = q.view(B, T, self.n_head, C//self.n_head).transpose(1, 2) 
-        k = k.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C//self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) 
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # build (or rebuild) cache for this sequence length/device/dtype
+        # cache shapes: (1, 1, T, head_dim)
+        cos, sin = self._get_rope_cos_sin(T, x.device, q.dtype)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
 
         # NOTE: 
         # the following attn_mask is equal to is_causal = True 
@@ -108,20 +241,28 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        
+        # Common modern choice is hidden_dim ~= int(8/3 * n_embd) to keep compute similar to 4x GELU MLP
+        hidden_dim = int((8 * config.n_embd) / 3)
+        # make it divisible by 64 for GPU friendliness 
+        hidden_dim = (hidden_dim + 63) // 64 * 64
+        self.hidden_dim = hidden_dim
 
-        # output shape by 4 for better performance of activation function 
         # fc = fully connected(dense)
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
 
-        # activation function(Gaussian Error Linear Unit)
-        # adding non-linearity, fixed expression(not trainable)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.silu = nn.SiLU()
+ 
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+
+        # SwiGlu, Swish Gated Linear Unit
+        a, b = x.split(self.hidden_dim, dim=-1)
+        x = a * self.silu(b)
+
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -130,9 +271,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config)
+        self.ln_1 = RMSNorm(config) # originally layernorm
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config)
+        self.ln_2 = RMSNorm(config)
         self.mlp = MLP(config)
 
     # layernorm1 -> attn -> residual -> layernorm2 -> mlp -> residual 
@@ -154,6 +295,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rope_base: float = 10000.0
 
 
 class GPT(nn.Module):
@@ -167,14 +309,13 @@ class GPT(nn.Module):
         self.config = config
 
         # nn.Embedding is a module that input idx and output embedding without matmul, just simple mapping
-        # wte word token embedding, wpe word position embedding
+        # wte word token embedding
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.wpe = nn.Embedding(config.block_size, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
         # last layernorm 
-        self.ln_f = LayerNorm(config)
+        self.ln_f = RMSNorm(config) # originally layernorm
 
         # last linear layer
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -199,17 +340,8 @@ class GPT(nn.Module):
 
 
 
-    def get_num_params(self, non_embeddings=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings(wte) would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-    
+    def get_num_params(self):
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embeddings:
-            n_params -= self.wpe.weight.numel()
         return n_params
 
 
@@ -231,14 +363,9 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        # pos = position
-        # create a 1d tensor from 0 to T-1 in order
-        # this is the position idx
-        pos = torch.arange(0, T, dtype=torch.long, device=device)
-
         tok_emb = self.wte(idx)
-        pos_emb = self.wpe(pos)
-        x = self.dropout(tok_emb + pos_emb)        
+        x = self.dropout(tok_emb)
+     
         for block in self.h:
             x = block(x)
         x = self.ln_f(x)
@@ -274,8 +401,6 @@ class GPT(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
 
-        # overwriting the original parameter
-        self.wpe.weight = nn.Parameter(self.wpe.weight[:block_size, :])
         # if manual attn, need to include attn.bias because attn_mask is coded with block_size
         # sdpa with is_casual=True does not depend on block_size
 
