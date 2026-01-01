@@ -70,20 +70,32 @@ class CausalSelfAttention(nn.Module):
         # weight.shape = (output_dim, input_dim)
         # n_embd(c_in) @ (output_dim, input_dim).t() = shape(output_dim, )    # .transpose(...) for general usage, .t() for 2d matrix only
         # broadcast c to b, t
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        q_dim = config.n_embd
+        kv_dim = config.n_kv_head * (config.n_embd // config.n_head)
+        self.c_attn = nn.Linear(config.n_embd, q_dim + 2 * kv_dim, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        # dropout only affects the activations, zeroing out the activations but not the parameters
-        self.resid_dropout = nn.Dropout(config.dropout)
+        # dropout only affects the activations, zeroing out the activations but not the parameters)
+        self.attn_dropout = float(getattr(config, "attn_dropout", config.dropout))
+        self.resid_dropout_p = float(getattr(config, "resid_dropout", config.dropout))
+        self.resid_dropout = nn.Dropout(self.resid_dropout_p)
 
         # add attributes from config to reuse it in class methods
         self.block_size = config.block_size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.dropout = config.dropout
+        self.n_kv_head = config.n_kv_head
+        self.n_rep = self.n_head // self.n_kv_head  # how many query heads share one kv head/ config.n_head
+        self.qk_rmsnorm = config.qk_rmsnorm
+        self.qk_rmsnorm_eps = float(getattr(config, "qk_rmsnorm_eps", 1e-6))
         self.head_dim = config.n_embd // config.n_head
+        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
+        assert self.n_head % self.n_kv_head == 0
 
         self.rope_base = config.rope_base
+        self.rope_scale_factor = float(getattr(config, "rope_scale_factor", 1.0))
+        if self.rope_scale_factor <= 0:
+            raise ValueError("rope_scale_factor must be > 0")
 
         # register buffer is used to store tensors that are not trainable
         # persistent=False means the buffer will not be saved in the checkpoint
@@ -100,6 +112,59 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("rope_cos_cached", None, persistent=False)
         self.register_buffer("rope_sin_cached", None, persistent=False)
         self.rope_cache_len = 0
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, n_kv_head, T, head_dim)
+        return: (B, n_head, T, head_dim) by repeating each kv head n_rep times
+        """
+        if self.n_rep == 1:
+            return x
+        return x.repeat_interleave(self.n_rep, dim=1).contiguous()
+    
+    @staticmethod
+    def _rms_norm_lastdim(x: torch.Tensor, eps: float) -> torch.Tensor:
+        # x: (..., head_dim)
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+    def _gqa_sdpa_no_repeat(
+        self,
+        q: torch.Tensor,  # (B, n_head, T, hd)
+        k: torch.Tensor,  # (B, n_kv_head, S, hd)
+        v: torch.Tensor,  # (B, n_kv_head, S, hd)
+        attn_mask: torch.Tensor | None,
+        dropout_p: float,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        B, nh, T, hd = q.shape
+        _, nk, S, _ = k.shape
+        assert nh == self.n_head and nk == self.n_kv_head
+        assert nh % nk == 0
+        n_rep = nh // nk
+
+        # (B, nk, n_rep, T, hd)
+        qg = q.view(B, nk, n_rep, T, hd)
+
+        outs = []
+        for g in range(nk):
+            # q: (B, n_rep, T, hd)
+            q_g = qg[:, g, :, :, :]
+            # k,v: (B, 1, S, hd) shared for all reps in this group
+            k_g = k[:, g:g+1, :, :].expand(B, n_rep, S, hd)
+            v_g = v[:, g:g+1, :, :].expand(B, n_rep, S, hd)
+
+            # Broadcast k_g/v_g across heads automatically (1 -> n_rep)
+            out_g = F.scaled_dot_product_attention(
+                q_g, k_g, v_g,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+            )  # (B, n_rep, T, hd)
+            outs.append(out_g)
+
+        # concat group outputs back to (B, n_head, T, hd)
+        y = torch.cat(outs, dim=1)
+        return y
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -127,59 +192,50 @@ class CausalSelfAttention(nn.Module):
         # the return of _apply_rope is same as (a, b) = (acosθ − bsinθ, asinθ + bcosθ)
         return (x * cos) + (CausalSelfAttention._rotate_half(x) * sin)
 
-    def _rope_cos_sin_from_positions_math(
+    def _rope_cos_sin_from_positions(
         self,
-        positions: torch.Tensor,  # (W,)
+        positions: torch.Tensor,   # (T,) int/long positions
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # compute in float32 for accuracy
-        pos = positions.to(device=device, dtype=torch.float32)  # (W,)
+        """
+        Build RoPE cos/sin for given absolute positions.
+        Returns cos/sin of shape (1, 1, T, head_dim) in `dtype` on `device`.
+        """
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even head_dim, got {self.head_dim}")
 
-        # inv_freq: (head_dim/2,)
-        # the general magnitude of the rotation for each pair in hs, within the range 0, 1
+        pos = positions.to(device=device, dtype=torch.float32)  # (T,)
+        if self.rope_scale_factor != 1.0:
+            pos = pos / self.rope_scale_factor
+
         inv_freq = 1.0 / (
-            self.rope_base
-            ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim)
-        )
+            self.rope_base ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim)
+        )  # (head_dim/2,)
 
-        # freqs: (W, head_dim/2)
-        # torch.outer is for two 1d tensors (pos, 1) @ (1, inv_freq)
-        freqs = torch.outer(pos, inv_freq)
+        freqs = torch.outer(pos, inv_freq)                      # (T, head_dim/2)
+        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1) # (T, head_dim)
 
-        # expand to (W, head_dim) by interleaving
-        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)
-
-        cos = emb.cos()[None, None, :, :].to(dtype=dtype)  # (1,1,W,hd)
-        sin = emb.sin()[None, None, :, :].to(dtype=dtype)
-        return cos, sin
-    
-    @staticmethod
-    def _build_rope_cache(
-        seq_len: int,
-        head_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        base: float = 10000.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if head_dim % 2 != 0:
-            raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
-
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)
-
-        cos = emb.cos()[None, None, :, :].to(dtype=dtype)
+        cos = emb.cos()[None, None, :, :].to(dtype=dtype)       # (1,1,T,head_dim)
         sin = emb.sin()[None, None, :, :].to(dtype=dtype)
         return cos, sin
 
-    def _get_rope_cos_sin(
-        self,
-        T: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _causal_mask_with_past(self, q_len: int, k_len: int, past_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Returns a boolean mask of shape (q_len, k_len) where True means "masked out".
+        Allows query position i to attend to keys <= past_len + i.
+        """
+        # key positions: 0..k_len-1
+        key_pos = torch.arange(k_len, device=device)  # (k_len,)
+        # query positions in the *full* sequence: past_len..past_len+q_len-1
+        query_pos = past_len + torch.arange(q_len, device=device)  # (q_len,)
+
+        # broadcast: (q_len, k_len)
+        # mask out keys with position > query_pos
+        mask = key_pos[None, :] > query_pos[:, None]
+        return mask
+
+    def _get_rope_cos_sin(self, T: int, device: torch.device, dtype: torch.dtype):
         need_rebuild = (
             self.rope_cos_cached is None
             or self.rope_sin_cached is None
@@ -190,13 +246,8 @@ class CausalSelfAttention(nn.Module):
             or self.rope_sin_cached.dtype != dtype
         )
         if need_rebuild:
-            cos, sin = self._build_rope_cache(
-                seq_len=T,
-                head_dim=self.head_dim,
-                device=device,
-                dtype=dtype,
-                base=self.rope_base,
-            )
+            positions = torch.arange(T, device=device, dtype=torch.long)
+            cos, sin = self._rope_cos_sin_from_positions(positions, device=device, dtype=dtype)
             self.rope_cos_cached = cos
             self.rope_sin_cached = sin
             self.rope_cache_len = T
@@ -211,12 +262,7 @@ class CausalSelfAttention(nn.Module):
     ) -> None:
         W = self.rope_window_size
         positions = torch.arange(start_pos, start_pos + W, device=device, dtype=torch.long)
-
-        # compute cos/sin for these absolute positions (vectorized)
-        # reusing your existing math, but without growing unbounded
-        cos, sin = self._rope_cos_sin_from_positions_math(positions=positions, device=device, dtype=dtype)
-
-        # NOTE: we assign to the already-registered buffers; avoid re-registering names repeatedly
+        cos, sin = self._rope_cos_sin_from_positions(positions, device=device, dtype=dtype)
         self.rope_cos_window = cos
         self.rope_sin_window = sin
         self.rope_window_start_pos = start_pos
@@ -227,6 +273,7 @@ class CausalSelfAttention(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         assert positions.dim() == 1 and positions.numel() > 0
 
         min_pos = int(positions.min().item())
@@ -267,14 +314,18 @@ class CausalSelfAttention(nn.Module):
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], int]:
         B, T, C = x.shape
 
-        # dim = the dimension of the split on matrix
-        # after passing self.c_attn the shape is (b, t, 3 * c)
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        head_dim = self.head_dim
+        q_dim = self.n_embd
+        kv_dim = self.n_kv_head * head_dim
 
+        qkv = self.c_attn(x) 
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=2)
+        
         # (B, n_head, T, head_size)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        k = k.view(B, T, self.n_kv_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, head_dim).transpose(1, 2)
 
         # total length = cached + current
         past_len = 0 if past_kv is None else past_kv[0].size(2)
@@ -284,6 +335,9 @@ class CausalSelfAttention(nn.Module):
         if not use_cache:
             # training/full forward: positions are [0..T-1]
             cos, sin = self._get_rope_cos_sin(T, x.device, q.dtype)
+            assert cos.device == x.device and sin.device == x.device
+            assert cos.dtype == q.dtype and sin.dtype == q.dtype
+            assert cos.size(-1) == self.head_dim and sin.size(-1) == self.head_dim
             q = self._apply_rope(q, cos, sin)
             k = self._apply_rope(k, cos, sin)
         else:
@@ -309,6 +363,28 @@ class CausalSelfAttention(nn.Module):
             pos_offset += drop
 
         present = (k, v)
+        past_len_eff = k.size(2) - T
+        dropout_p = self.attn_dropout if self.training else 0.0
+
+        if self.qk_rmsnorm:
+            q = self._rms_norm_lastdim(q, self.qk_rmsnorm_eps)
+            k = self._rms_norm_lastdim(k, self.qk_rmsnorm_eps)
+
+        k_len = k.size(2)   # S
+        q_len = q.size(2)   # T
+
+        attn_mask = None
+        is_causal = True
+
+        # When decoding with cache, K is longer than Q; be explicit and safe
+        if use_cache and past_len_eff > 0:
+            attn_mask = self._causal_mask_with_past(
+                q_len=q_len,
+                k_len=k_len,
+                past_len=past_len_eff,
+                device=x.device,
+            )
+            is_causal = False
 
         # NOTE:
         # the following attn_mask is equal to is_causal = True
@@ -336,13 +412,13 @@ class CausalSelfAttention(nn.Module):
         # y = att @ v
         # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # (T, hs): hs is the actual activations for each T, with dim (n_embd//head_size)
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0,
-            is_causal=True,
+        y = self._gqa_sdpa_no_repeat(
+            q=q,
+            k=k,
+            v=v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
         )
 
         # use contiguous before view if it's after transpose() immediately, which is the only use case of contiguous()
@@ -370,7 +446,7 @@ class MLP(nn.Module):
         self.silu = nn.SiLU()
  
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(getattr(config, "resid_dropout", config.dropout))
         
     def forward(self, x):
         x = self.c_fc(x)
@@ -414,14 +490,21 @@ class Block(nn.Module):
 class GPTConfig:
     # name: type = value strucutre is required, it is also a way to define data type in python 
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for gpu efficiency
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for gpu efficiency
     n_layer: int = 12
     n_head: int = 12
+    n_kv_head: int = 3
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    attn_dropout: float = 0.0
+    resid_dropout: float = 0.0
+    emb_dropout: float = 0.0
+    bias: bool = False  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     rope_base: float = 10000.0
-
+    rope_scale_factor: float = 1.0
+    qk_rmsnorm: bool = False
+    qk_rmsnorm_eps: float = 1e-6
+    
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -436,7 +519,8 @@ class GPT(nn.Module):
         # nn.Embedding is a module that input idx and output embedding without matmul, just simple mapping
         # wte word token embedding
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.dropout = nn.Dropout(config.dropout)
+        emb_p = getattr(config, "emb_dropout", config.dropout)
+        self.dropout = nn.Dropout(emb_p)
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
         # last layernorm 
@@ -490,6 +574,9 @@ class GPT(nn.Module):
         device = idx.device
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # idx must be integer token ids
+        assert idx.dtype == torch.long, f"idx must be torch.long, got {idx.dtype}"
+        assert idx.dim() == 2, f"idx must be (B,T), got shape {tuple(idx.shape)}"
 
         tok_emb = self.wte(idx)
         x = self.dropout(tok_emb)
@@ -619,6 +706,8 @@ class GPT(nn.Module):
     ):
 
         assert idx.dim() == 2, f"idx must be (B,T), got shape {tuple(idx.shape)}"
+        assert idx.dtype == torch.long, f"idx must be torch.long, got {idx.dtype}"
+        
         B, T = idx.size()
         device = idx.device
         past_kv = None
