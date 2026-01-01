@@ -1,10 +1,11 @@
-import math
 import inspect
+import math
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
-# torch.nn.functional are the lowest level of python code, lower level codes are cuda and c++
-import torch.nn.functional as F
+import torch.nn.functional as F  # lower level codes are c++ cuda
+
 
 # NOTE: LayerNorm is unused in this model
 # normalization, keep the scale , for stable and faster training 
@@ -14,15 +15,14 @@ class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False. Use nn.LayerNorm for bias"""
 
     def __init__(self, config):
-        
         # super init for self.parameters()/ model.to() eval() train()/ state_dict() load_state_dict()
         super().__init__()
+
         self.weight = nn.Parameter(torch.ones(config.n_embd))
         self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
     
     # calling model like model(x) or self(x) will by default use the forward method
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        
         # x = B*T*C
         # x_hat = (x[i] - mean)/(sqrt(variance + epsilon)) for each single number in c    # standardization 
         # output = weight * x_hat + bias        # weight and x_hat and bias are shpae (c, )
@@ -31,12 +31,14 @@ class LayerNorm(nn.Module):
         # self.weight.shape is the dimension to apply normalization, accept single number or shape     
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
 # manually apply Root Mean Square Normalization, the better version is fused RMSNorm with module import on GPU
 class RMSNorm(nn.Module):
     """RMSNorm with optional bias (bias is typically False in modern LLMs)."""
 
     def __init__(self, config, eps: float = 1e-5):
         super().__init__()
+
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(config.n_embd))
         self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
@@ -53,12 +55,13 @@ class RMSNorm(nn.Module):
             y = y + self.bias
         return y
 
+
 # Causal Self Attention with Rotary Position Embedding (RoPE)
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0 
+
+        assert config.n_embd % config.n_head == 0
 
         # nn.Linear(input_dimension, ouptut_dimension, bias)
         # nn.Linear weight always 2d, bias always 1d
@@ -66,14 +69,15 @@ class CausalSelfAttention(nn.Module):
         # x = n_embd
         # weight.shape = (output_dim, input_dim)
         # n_embd(c_in) @ (output_dim, input_dim).t() = shape(output_dim, )    # .transpose(...) for general usage, .t() for 2d matrix only
-        # broadcast c to b, t      
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias = config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias = config.bias)
+        # broadcast c to b, t
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        # dropout only affects the activations, zeroing out the activations but not the parameters 
+        # dropout only affects the activations, zeroing out the activations but not the parameters
         self.resid_dropout = nn.Dropout(config.dropout)
 
         # add attributes from config to reuse it in class methods
+        self.block_size = config.block_size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
@@ -83,6 +87,16 @@ class CausalSelfAttention(nn.Module):
 
         # register buffer is used to store tensors that are not trainable
         # persistent=False means the buffer will not be saved in the checkpoint
+        #
+        # NOTE:
+        # We keep a bounded RoPE "window" cache to avoid unbounded growth when using
+        # KV-cache + sliding window attention. This cache stores cos/sin for a fixed
+        # contiguous span of absolute positions.
+        self.rope_window_size = config.block_size  # or separate config
+        self.register_buffer("rope_cos_window", None, persistent=False)  # (1,1,W,hd)
+        self.register_buffer("rope_sin_window", None, persistent=False)  # (1,1,W,hd)
+        self.rope_window_start_pos = 0  # python int, not a buffer
+
         self.register_buffer("rope_cos_cached", None, persistent=False)
         self.register_buffer("rope_sin_cached", None, persistent=False)
         self.rope_cache_len = 0
@@ -91,7 +105,7 @@ class CausalSelfAttention(nn.Module):
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
         # x is a tensor of shape (B, nh, T, hs)
         # rotation is done on the last dimension (hs)
-        
+
         # x1 = x[..., ::2] means x1 = x[0], x[2], x[4], ...
         # x2 = x[..., 1::2] means x2 = x[1], x[3], x[5], ...
         x1 = x[..., ::2]
@@ -113,6 +127,33 @@ class CausalSelfAttention(nn.Module):
         # the return of _apply_rope is same as (a, b) = (acosθ − bsinθ, asinθ + bcosθ)
         return (x * cos) + (CausalSelfAttention._rotate_half(x) * sin)
 
+    def _rope_cos_sin_from_positions_math(
+        self,
+        positions: torch.Tensor,  # (W,)
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # compute in float32 for accuracy
+        pos = positions.to(device=device, dtype=torch.float32)  # (W,)
+
+        # inv_freq: (head_dim/2,)
+        # the general magnitude of the rotation for each pair in hs, within the range 0, 1
+        inv_freq = 1.0 / (
+            self.rope_base
+            ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim)
+        )
+
+        # freqs: (W, head_dim/2)
+        # torch.outer is for two 1d tensors (pos, 1) @ (1, inv_freq)
+        freqs = torch.outer(pos, inv_freq)
+
+        # expand to (W, head_dim) by interleaving
+        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)
+
+        cos = emb.cos()[None, None, :, :].to(dtype=dtype)  # (1,1,W,hd)
+        sin = emb.sin()[None, None, :, :].to(dtype=dtype)
+        return cos, sin
+    
     @staticmethod
     def _build_rope_cache(
         seq_len: int,
@@ -121,29 +162,15 @@ class CausalSelfAttention(nn.Module):
         dtype: torch.dtype,
         base: float = 10000.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns cos, sin caches of shape (1, 1, T, head_dim).
-        head_dim must be even.
-        """
         if head_dim % 2 != 0:
             raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
 
-        # seq_len: [0, 1, 2, ..., seq_len-1]
-        # intentionally compute in dtype=torch.float32 to prevent loss of accuracy
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
-
-        # inv_freq: (head_dim/2,)
-        # the general magnitude of the rotation for each pair in hs, within the range 0, 1
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-
-        # freqs: (T, head_dim/2)
-        # torch.outer is for two 1d tensors (t, 1) @ (1, inv_freq)
         freqs = torch.outer(t, inv_freq)
-
-        # expand to (T, head_dim) by interleaving
         emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)
 
-        cos = emb.cos()[None, None, :, :].to(dtype=dtype)  # (1,1,T,hd)
+        cos = emb.cos()[None, None, :, :].to(dtype=dtype)
         sin = emb.sin()[None, None, :, :].to(dtype=dtype)
         return cos, sin
 
@@ -153,7 +180,6 @@ class CausalSelfAttention(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # rebuild if cache is missing, too short, wrong device, or wrong dtype
         need_rebuild = (
             self.rope_cos_cached is None
             or self.rope_sin_cached is None
@@ -163,7 +189,6 @@ class CausalSelfAttention(nn.Module):
             or self.rope_cos_cached.dtype != dtype
             or self.rope_sin_cached.dtype != dtype
         )
-
         if need_rebuild:
             cos, sin = self._build_rope_cache(
                 seq_len=T,
@@ -172,37 +197,121 @@ class CausalSelfAttention(nn.Module):
                 dtype=dtype,
                 base=self.rope_base,
             )
-
-            # Re-register so they remain proper buffers (and move with .to(), etc.)
-            # This overwrites the existing buffer entries with new tensors.
-            self.register_buffer("rope_cos_cached", cos, persistent=False)
-            self.register_buffer("rope_sin_cached", sin, persistent=False)
+            self.rope_cos_cached = cos
+            self.rope_sin_cached = sin
             self.rope_cache_len = T
 
-        cos = self.rope_cos_cached[:, :, :T, :]
-        sin = self.rope_sin_cached[:, :, :T, :]
+        return self.rope_cos_cached, self.rope_sin_cached
+
+    def _build_rope_window(
+        self,
+        start_pos: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        W = self.rope_window_size
+        positions = torch.arange(start_pos, start_pos + W, device=device, dtype=torch.long)
+
+        # compute cos/sin for these absolute positions (vectorized)
+        # reusing your existing math, but without growing unbounded
+        cos, sin = self._rope_cos_sin_from_positions_math(positions=positions, device=device, dtype=dtype)
+
+        # NOTE: we assign to the already-registered buffers; avoid re-registering names repeatedly
+        self.rope_cos_window = cos
+        self.rope_sin_window = sin
+        self.rope_window_start_pos = start_pos
+
+    def _get_rope_cos_sin_bounded(
+        self,
+        positions: torch.Tensor,  # (T,)
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert positions.dim() == 1 and positions.numel() > 0
+
+        min_pos = int(positions.min().item())
+        max_pos = int(positions.max().item())
+
+        start = self.rope_window_start_pos
+        end = start + self.rope_window_size - 1
+
+        need_rebuild = (
+            self.rope_cos_window is None
+            or self.rope_sin_window is None
+            or self.rope_cos_window.device != device
+            or self.rope_sin_window.device != device
+            or self.rope_cos_window.dtype != dtype
+            or self.rope_sin_window.dtype != dtype
+            or min_pos < start
+            or max_pos > end
+        )
+
+        if need_rebuild:
+            # Center window around max_pos. For decode T=1 this is the token position.
+            new_start = max(0, max_pos - (self.rope_window_size - 1))
+            self._build_rope_window(new_start, device, dtype)
+            start = self.rope_window_start_pos
+
+        # map absolute positions -> window indices
+        idx = (positions - start).to(torch.long)  # (T,)
+        cos = self.rope_cos_window.index_select(2, idx)  # (1,1,T,hd)
+        sin = self.rope_sin_window.index_select(2, idx)
         return cos, sin
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        pos_offset: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], int]:
         B, T, C = x.shape
 
         # dim = the dimension of the split on matrix
-        # after passing self.c_attn the shape is (b, t, 3 * c) 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  
-        
+        # after passing self.c_attn the shape is (b, t, 3 * c)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+
         # (B, n_head, T, head_size)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) 
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
+        # total length = cached + current
+        past_len = 0 if past_kv is None else past_kv[0].size(2)
+
         # build (or rebuild) cache for this sequence length/device/dtype
         # cache shapes: (1, 1, T, head_dim)
-        cos, sin = self._get_rope_cos_sin(T, x.device, q.dtype)
-        q = self._apply_rope(q, cos, sin)
-        k = self._apply_rope(k, cos, sin)
+        if not use_cache:
+            # training/full forward: positions are [0..T-1]
+            cos, sin = self._get_rope_cos_sin(T, x.device, q.dtype)
+            q = self._apply_rope(q, cos, sin)
+            k = self._apply_rope(k, cos, sin)
+        else:
+            # decoding/KV cache: absolute positions with bounded window
+            positions = torch.arange(
+                pos_offset + past_len,
+                pos_offset + past_len + T,
+                device=x.device,
+                dtype=torch.long,
+            )
+            cos, sin = self._get_rope_cos_sin_bounded(positions, x.device, q.dtype)
+            q = self._apply_rope(q, cos, sin)
+            k = self._apply_rope(k, cos, sin)
 
-        # NOTE: 
-        # the following attn_mask is equal to is_causal = True 
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)  # concat on T dimension
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        if k.size(2) > self.block_size:
+            drop = k.size(2) - self.block_size
+            k = k[:, :, drop:, :].contiguous()
+            v = v[:, :, drop:, :].contiguous()
+            pos_offset += drop
+
+        present = (k, v)
+
+        # NOTE:
+        # the following attn_mask is equal to is_causal = True
         # attn_mask = torch.ones(T, T)
         # attn_mask = torch.triu(attn_mask, diagonal=1)
         # attn_mask[attn_mask == 1] = -torch.inf
@@ -213,32 +322,39 @@ class CausalSelfAttention(nn.Module):
         #         [  0.,   0.,   0., -inf],
         #         [  0.,   0.,   0.,   0.]])
 
-        # NOTE: 
+        # NOTE:
         # manual apply of SDPA
         # att = (q @ k.transpose(2, 3)) * (1.0 / math.sqrt(k.size(-1)))     output:(B, nh, T, T)
         # (T, hs) @ (hs, T) = (T, T) for each in every batch and every heads
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -torch.inf)
         # apply mask manually (masked_fill not yet defined)
         # att = F.softmax(att, dim=-1)
-        # T(row) * T(column) 
-        # apply softmax on column: vectors in a row will sum to one 
+        # T(row) * T(column)
+        # apply softmax on column: vectors in a row will sum to one
         # att = self.attn_dropout(att)
-        # apply dropout manually (self.attn_dropout not defined) 
-        # y = att @ v 
+        # apply dropout manually (self.attn_dropout not defined)
+        # y = att @ v
         # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # (T, hs): hs is the actual activations for each T, with dim (n_embd//head_size)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        
-        # use contiguous before view if it's after transpose() immediately, which is the only use case of contiguous() 
-        y = y.transpose(1, 2).contiguous().view(B, T, C) 
-        
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0,
+            is_causal=True,
+        )
+
+        # use contiguous before view if it's after transpose() immediately, which is the only use case of contiguous()
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
         # do a linear before residual to learn the multi-head feature
         y = self.resid_dropout(self.c_proj(y))
-        return y
+
+        return y, present, pos_offset
 
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         
@@ -255,7 +371,7 @@ class MLP(nn.Module):
  
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
-
+        
     def forward(self, x):
         x = self.c_fc(x)
 
@@ -267,26 +383,35 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class Block(nn.Module):
 
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
+
         self.ln_1 = RMSNorm(config) # originally layernorm
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config)
         self.mlp = MLP(config)
 
     # layernorm1 -> attn -> residual -> layernorm2 -> mlp -> residual 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        pos_offset: int = 0,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], int]:
+
+        attn_out, present, pos_offset = self.attn(self.ln_1(x), past_kv=past_kv, pos_offset=pos_offset, use_cache=use_cache)
 
         # adding x is called residual connection, where x is the residual
-        x = x + self.attn(self.ln_1(x))
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present, pos_offset
+
 
 @dataclass
 class GPTConfig:
-
     # name: type = value strucutre is required, it is also a way to define data type in python 
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for gpu efficiency
@@ -299,9 +424,9 @@ class GPTConfig:
 
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
+
         assert config.vocab_size is not None
         assert config.block_size is not None
 
@@ -323,7 +448,7 @@ class GPT(nn.Module):
         # wte is at the start of the model (idx) to (activations)
         # lm_head is at the last of the model (activations) to (idx) 
         # gradient is calculated from both methods for each update of weight 
-        self.wte.weight = self.lm_head.weight 
+        self.lm_head.weight = self.wte.weight
 
         # self defined _init_weights, use apply to do recursive initialization
         self.apply(self._init_weights)
@@ -338,17 +463,13 @@ class GPT(nn.Module):
 
         print(f"number of parameters: {self.get_num_params() / 1e6:.2f}M")
 
-
-
     def get_num_params(self):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-
     #start with _ to remind user this function should not be called outside of the class
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-
             # module.weight/ module.bias = self.weight/self.bias for that module
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -356,7 +477,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        past_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        pos_offsets: list[int] | None = None,
+        use_cache: bool = False,
+    ):
 
         # idx is a tensor which always have the attribute of .device
         device = idx.device
@@ -366,8 +494,32 @@ class GPT(nn.Module):
         tok_emb = self.wte(idx)
         x = self.dropout(tok_emb)
      
-        for block in self.h:
-            x = block(x)
+        if use_cache:
+            if past_kv is None:
+                past_kv = [None] * len(self.h)
+            if pos_offsets is None:
+                pos_offsets = [0] * len(self.h)
+
+            presents: list[tuple[torch.Tensor, torch.Tensor]] = []
+            new_offsets: list[int] = []
+
+            for i, (block, layer_past) in enumerate(zip(self.h, past_kv)):
+                x, present, new_off = block(
+                    x,
+                    past_kv=layer_past,
+                    pos_offset=pos_offsets[i],
+                    use_cache=True,
+                )
+                presents.append(present)
+                new_offsets.append(new_off)
+
+        else:
+            # training/full forward: no KV cache bookkeeping
+            for block in self.h:
+                x, _, _ = block(x, past_kv=None, pos_offset=0, use_cache=False)
+            presents = None
+            new_offsets = None
+
         x = self.ln_f(x)
 
         if targets is not None:
@@ -393,23 +545,21 @@ class GPT(nn.Module):
             # use [-1] to preserve the 3d shape of logits for training, fetching the lass row(T)
             logits = self.lm_head(x[:,[-1],:])
             loss = None
-        
-        return logits, loss
 
+        if use_cache:
+            return logits, loss, presents, new_offsets
+        return logits, loss
 
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-
+        for block in self.h:
+            block.attn.block_size = block_size
+            block.attn.rope_window_size = block_size
         # if manual attn, need to include attn.bias because attn_mask is coded with block_size
         # sdpa with is_casual=True does not depend on block_size
 
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        pass
-
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-
         # decay_params for weights but not bias 
         # weight decay is L2 regularization, discouraging large weight values
         decay_params = [p for pn, p in self.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -438,7 +588,6 @@ class GPT(nn.Module):
 
         return optimizer
 
-
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         N = self.get_num_params()
@@ -454,8 +603,7 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         idx: torch.Tensor,
@@ -473,6 +621,8 @@ class GPT(nn.Module):
         assert idx.dim() == 2, f"idx must be (B,T), got shape {tuple(idx.shape)}"
         B, T = idx.size()
         device = idx.device
+        past_kv = None
+        pos_offsets = None
         # finished is a boolean tensor of shape (B, )
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         # eos is a single number tensor, eos_token_id is an int
@@ -480,10 +630,9 @@ class GPT(nn.Module):
         eos = torch.tensor(eos_token_id, device=device, dtype=idx.dtype) if eos_token_id is not None else None
 
         for step in range(max_new_tokens):
-            # slice it to block_size
-            idx_cond = idx[:, -self.config.block_size:]
-            # self() = forward pass
-            logits, _ = self(idx_cond)
+            idx_cond = idx[:, -self.config.block_size:] if past_kv is None else idx[:, -1:]
+            logits, _, past_kv, pos_offsets = self(idx_cond, past_kv=past_kv, pos_offsets=pos_offsets, use_cache=True)
+
             # get the last token
             logits = logits[:, -1, :]  # (B, vocab)
 
@@ -510,10 +659,10 @@ class GPT(nn.Module):
                     # in case top_k is larger than the vocabulary size
                     k = min(int(top_k), logits.size(-1))
                     # topk returns the k largest values and their indices
-                    v, _ = torch.topk(logits, k)
+                    topk_vals, _ = torch.topk(logits, k)
                     # mask out the values that are smaller than the k largest values
-                    # v[-1] is the smallest k, preserving the dimension
-                    logits = logits.masked_fill(logits < v[:, [-1]], -torch.inf)
+                    # topk_vals[-1] is the smallest k, preserving the dimension
+                    logits = logits.masked_fill(logits < topk_vals[:, [-1]], -torch.inf)
 
                 # apply top_p after some logits are masked by top_k
                 if top_p is not None:
@@ -597,29 +746,3 @@ class GPT(nn.Module):
         if return_lengths:
             return idx, lengths
         return idx
-
-# if __name__ == "__main__":
-#     import torch
-
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-#     config = GPTConfig(
-#         block_size=128,
-#         vocab_size=100,
-#         n_layer=2,
-#         n_head=2,
-#         n_embd=64,
-#         dropout=0.0,
-#         bias=True
-#     )
-
-#     model = GPT(config).to(device)
-#     model.eval()
-
-#     idx = torch.zeros((1, 1), dtype=torch.long, device=device)
-
-#     with torch.no_grad():
-#         out = model.generate(idx, max_new_tokens=10)
-
-#     print("Sanity check passed.")
-#     print("Output shape:", out.shape)
