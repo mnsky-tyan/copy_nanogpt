@@ -21,3 +21,13 @@ I’m grateful to Karpathy for making NanoGPT available and easy to learn from.
 - Not an official NanoGPT fork
 - Not guaranteed to be production-ready or stable
 - Not intended as a drop-in replacement for NanoGPT
+
+## How to run
+
+- Run `python data/prepareeos.py` to fetch/prepare the data. This script writes `input.txt` and generates `data/train.bin` and `data/val.bin` from it. (`input_eos.txt` is for reference only and is not used by the code.)
+- Run `python train.py` to train the model using `data/train.bin` and `data/val.bin`.
+- After training, the checkpoint is saved to `saved_model/ckpt.pt`.
+- Use `python saved_model/inspect_ckpt.py` to inspect the saved checkpoint.
+- Run `python chat.py` for interactive chatbot mode, or `python sample.py` to generate a batch of samples from a fixed model input.
+- `train.py`, `chat.py`, and `sample.py` all accept CLI flags (e.g. `python train.py --batch_size=4`).
+- `train.py`, `chat.py`, and `sample.py` also accept a Python config file (e.g. `python train.py my_config.py`). Variables defined in the file override the default arguments. Note: the config file is executed as Python code—only use trusted files, and keep it to argument/variable definitions.
