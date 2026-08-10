@@ -7,371 +7,122 @@ import torch.nn as nn
 import torch.nn.functional as F  # lower level codes are c++ cuda
 
 
-# NOTE: LayerNorm is unused in this model
-# normalization, keep the scale , for stable and faster training 
-# without: exploding gradients, activations, gradient descent becomes hard
-# activations: all the intermediate state of the input to output process
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False. Use nn.LayerNorm for bias"""
-
-    def __init__(self, config):
-        # super init for self.parameters()/ model.to() eval() train()/ state_dict() load_state_dict()
-        super().__init__()
-
-        self.weight = nn.Parameter(torch.ones(config.n_embd))
-        self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
-    
-    # calling model like model(x) or self(x) will by default use the forward method
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x = B*T*C
-        # x_hat = (x[i] - mean)/(sqrt(variance + epsilon)) for each single number in c    # standardization 
-        # output = weight * x_hat + bias        # weight and x_hat and bias are shpae (c, )
-        # weight * x_hat is elementwise, C = (weight_0*x_hat_0, weight_1*x_hat_1, ...) for all B and T
-        # 1e-5 is the epsilon for stablizing the calculation
-        # self.weight.shape is the dimension to apply normalization, accept single number or shape     
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
-
-
-# manually apply Root Mean Square Normalization, the better version is fused RMSNorm with module import on GPU
+# manual RMSNorm (a fused RMSNorm kernel is faster on GPU).
+# keeps activations at a stable scale (similar rms values), helping prevent exploding/vanishing gradients.
+# NOTE: the information is mostly retained after normalization:
+#     - residual stream
+#     - the learned weight and subsequent linear layers adapt to the normalized inputs
 class RMSNorm(nn.Module):
     """RMSNorm with optional bias (bias is typically False in modern LLMs)."""
 
     def __init__(self, config, eps: float = 1e-5):
+        # super init for self.parameters()/ model.to() .eval() .train()/ .state_dict() .load_state_dict() etc.
         super().__init__()
 
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(config.n_embd))
         self.bias = nn.Parameter(torch.zeros(config.n_embd)) if config.bias else None
 
+    # calling model(x) or self(x) will by default run the forward method
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C)
-        # rms = sqrt(mean(x^2) + eps) over the last dimension C
-        mean_square = x.pow(2).mean(dim=-1, keepdim=True)
-        inv_rms = torch.rsqrt(mean_square + self.eps)
-        x_norm = x * inv_rms
+        # rms = sqrt(mean(x^2) + eps)  (square all the values, take the mean, take the sqrt)
+        # choose x^2 then sqrt over absolute values for smooth gradients
+        # add epsilon to avoid division by zero
+        # rmsnorm = x/rms
+        mean_square = x.pow(2).mean(dim=-1, keepdim=True)  # (B, T, 1)
+        inv_rms = torch.rsqrt(mean_square + self.eps)  # reciprocal square root
+        x_norm = x * inv_rms  # elementwise multiplication
 
-        y = x_norm * self.weight  # broadcast over (B, T)
+        # scaling before entering the next layer
+        y = x_norm * self.weight
         if self.bias is not None:
             y = y + self.bias
         return y
 
 
-# Causal Self Attention with Rotary Position Embedding (RoPE)
+# Causal Self Attention with Rotary Positional Embedding (RoPE)
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
 
         assert config.n_embd % config.n_head == 0
-
-        # nn.Linear(input_dimension, ouptut_dimension, bias)
-        # nn.Linear weight always 2d, bias always 1d
-        # x @ w(transposed) + b
-        # x = n_embd
-        # weight.shape = (output_dim, input_dim)
-        # n_embd(c_in) @ (output_dim, input_dim).t() = shape(output_dim, )    # .transpose(...) for general usage, .t() for 2d matrix only
-        # broadcast c to b, t
-        q_dim = config.n_embd
-        kv_dim = config.n_kv_head * (config.n_embd // config.n_head)
-        self.c_attn = nn.Linear(config.n_embd, q_dim + 2 * kv_dim, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-
-        # dropout only affects the activations, zeroing out the activations but not the parameters)
-        self.attn_dropout = float(getattr(config, "attn_dropout", config.dropout))
-        self.resid_dropout_p = float(getattr(config, "resid_dropout", config.dropout))
-        self.resid_dropout = nn.Dropout(self.resid_dropout_p)
+        assert config.n_head % config.n_kv_head == 0
+        assert (config.n_embd // config.n_head) % 2 == 0  # RoPE requires even head_dim
+        assert config.rope_scale_factor > 0
 
         # add attributes from config to reuse it in class methods
         self.block_size = config.block_size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.n_kv_head = config.n_kv_head
-        self.n_rep = self.n_head // self.n_kv_head  # how many query heads share one kv head/ config.n_head
+        self.n_rep = config.n_head // config.n_kv_head  # how many query heads share one kv_head
         self.qk_rmsnorm = config.qk_rmsnorm
-        self.qk_rmsnorm_eps = float(getattr(config, "qk_rmsnorm_eps", 1e-6))
-        self.head_dim = config.n_embd // config.n_head
-        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
-        assert self.n_head % self.n_kv_head == 0
-
+        self.qk_rmsnorm_eps = config.qk_rmsnorm_eps
+        self.head_dim = config.n_embd // config.n_head  # head_dim is usually 64, for very large n_embd use 128
         self.rope_base = config.rope_base
-        self.rope_scale_factor = float(getattr(config, "rope_scale_factor", 1.0))
-        if self.rope_scale_factor <= 0:
-            raise ValueError("rope_scale_factor must be > 0")
+        self.rope_scale_factor = config.rope_scale_factor
+        self.rope_cos_cached = None
+        self.rope_sin_cached = None
 
-        # register buffer is used to store tensors that are not trainable
-        # persistent=False means the buffer will not be saved in the checkpoint
-        #
-        # NOTE:
-        # We keep a bounded RoPE "window" cache to avoid unbounded growth when using
-        # KV-cache + sliding window attention. This cache stores cos/sin for a fixed
-        # contiguous span of absolute positions.
-        self.rope_window_size = config.block_size  # or separate config
-        self.register_buffer("rope_cos_window", None, persistent=False)  # (1,1,W,hd)
-        self.register_buffer("rope_sin_window", None, persistent=False)  # (1,1,W,hd)
-        self.rope_window_start_pos = 0  # python int, not a buffer
+        # nn.Linear(input_dimension, ouptut_dimension, bias)
+        # for nn.Linear weight is always 2d, bias is always 1d
+        # x @ w(transposed) + b
+        # weight.shape = (output_dim, input_dim)
+        # n_embd @ (output_dim, input_dim).t() -> shape(output_dim, )
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd + 2 * config.n_kv_head * self.head_dim, bias=config.bias)  # Grouped-Query Attention (GQA)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        self.register_buffer("rope_cos_cached", None, persistent=False)
-        self.register_buffer("rope_sin_cached", None, persistent=False)
-        self.rope_cache_len = 0
-
-    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, n_kv_head, T, head_dim)
-        return: (B, n_head, T, head_dim) by repeating each kv head n_rep times
-        """
-        if self.n_rep == 1:
-            return x
-        return x.repeat_interleave(self.n_rep, dim=1).contiguous()
-    
-    @staticmethod
-    def _rms_norm_lastdim(x: torch.Tensor, eps: float) -> torch.Tensor:
-        # x: (..., head_dim)
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-
-    def _gqa_sdpa_no_repeat(
-        self,
-        q: torch.Tensor,  # (B, n_head, T, hd)
-        k: torch.Tensor,  # (B, n_kv_head, S, hd)
-        v: torch.Tensor,  # (B, n_kv_head, S, hd)
-        attn_mask: torch.Tensor | None,
-        dropout_p: float,
-        is_causal: bool,
-    ) -> torch.Tensor:
-        B, nh, T, hd = q.shape
-        _, nk, S, _ = k.shape
-        assert nh == self.n_head and nk == self.n_kv_head
-        assert nh % nk == 0
-        n_rep = nh // nk
-
-        # (B, nk, n_rep, T, hd)
-        qg = q.view(B, nk, n_rep, T, hd)
-
-        outs = []
-        for g in range(nk):
-            # q: (B, n_rep, T, hd)
-            q_g = qg[:, g, :, :, :]
-            # k,v: (B, 1, S, hd) shared for all reps in this group
-            k_g = k[:, g:g+1, :, :].expand(B, n_rep, S, hd)
-            v_g = v[:, g:g+1, :, :].expand(B, n_rep, S, hd)
-
-            # Broadcast k_g/v_g across heads automatically (1 -> n_rep)
-            out_g = F.scaled_dot_product_attention(
-                q_g, k_g, v_g,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-            )  # (B, n_rep, T, hd)
-            outs.append(out_g)
-
-        # concat group outputs back to (B, n_head, T, hd)
-        y = torch.cat(outs, dim=1)
-        return y
-
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        # x is a tensor of shape (B, nh, T, hs)
-        # rotation is done on the last dimension (hs)
-
-        # x1 = x[..., ::2] means x1 = x[0], x[2], x[4], ...
-        # x2 = x[..., 1::2] means x2 = x[1], x[3], x[5], ...
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-
-        # input = [10, 11, 20, 21, 30, 31]
-        # output = [-11, 10, -21, 20, -31, 30]
-        return torch.stack((-x2, x1), dim=-1).flatten(-2)
-
-    @staticmethod
-    def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """
-        Apply rotary embedding to x.
-        x: (B, nh, T, hs)
-        cos/sin: (1, 1, T, hs)
-        """
-
-        # standard rotation for (a, b)
-        # the return of _apply_rope is same as (a, b) = (acosθ − bsinθ, asinθ + bcosθ)
-        return (x * cos) + (CausalSelfAttention._rotate_half(x) * sin)
-
-    def _rope_cos_sin_from_positions(
-        self,
-        positions: torch.Tensor,   # (T,) int/long positions
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Build RoPE cos/sin for given absolute positions.
-        Returns cos/sin of shape (1, 1, T, head_dim) in `dtype` on `device`.
-        """
-        if self.head_dim % 2 != 0:
-            raise ValueError(f"RoPE requires an even head_dim, got {self.head_dim}")
-
-        pos = positions.to(device=device, dtype=torch.float32)  # (T,)
-        if self.rope_scale_factor != 1.0:
-            pos = pos / self.rope_scale_factor
-
-        inv_freq = 1.0 / (
-            self.rope_base ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim)
-        )  # (head_dim/2,)
-
-        freqs = torch.outer(pos, inv_freq)                      # (T, head_dim/2)
-        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1) # (T, head_dim)
-
-        cos = emb.cos()[None, None, :, :].to(dtype=dtype)       # (1,1,T,head_dim)
-        sin = emb.sin()[None, None, :, :].to(dtype=dtype)
-        return cos, sin
-
-    def _causal_mask_with_past(self, q_len: int, k_len: int, past_len: int, device: torch.device) -> torch.Tensor:
-        """
-        Returns a boolean mask of shape (q_len, k_len) where True means "masked out".
-        Allows query position i to attend to keys <= past_len + i.
-        """
-        # key positions: 0..k_len-1
-        key_pos = torch.arange(k_len, device=device)  # (k_len,)
-        # query positions in the *full* sequence: past_len..past_len+q_len-1
-        query_pos = past_len + torch.arange(q_len, device=device)  # (q_len,)
-
-        # broadcast: (q_len, k_len)
-        # mask out keys with position > query_pos
-        mask = key_pos[None, :] > query_pos[:, None]
-        return mask
-
-    def _get_rope_cos_sin(self, T: int, device: torch.device, dtype: torch.dtype):
-        need_rebuild = (
-            self.rope_cos_cached is None
-            or self.rope_sin_cached is None
-            or self.rope_cache_len < T
-            or self.rope_cos_cached.device != device
-            or self.rope_sin_cached.device != device
-            or self.rope_cos_cached.dtype != dtype
-            or self.rope_sin_cached.dtype != dtype
-        )
-        if need_rebuild:
-            positions = torch.arange(T, device=device, dtype=torch.long)
-            cos, sin = self._rope_cos_sin_from_positions(positions, device=device, dtype=dtype)
-            self.rope_cos_cached = cos
-            self.rope_sin_cached = sin
-            self.rope_cache_len = T
-
-        return self.rope_cos_cached, self.rope_sin_cached
-
-    def _build_rope_window(
-        self,
-        start_pos: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        W = self.rope_window_size
-        positions = torch.arange(start_pos, start_pos + W, device=device, dtype=torch.long)
-        cos, sin = self._rope_cos_sin_from_positions(positions, device=device, dtype=dtype)
-        self.rope_cos_window = cos
-        self.rope_sin_window = sin
-        self.rope_window_start_pos = start_pos
-
-    def _get_rope_cos_sin_bounded(
-        self,
-        positions: torch.Tensor,  # (T,)
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        assert positions.dim() == 1 and positions.numel() > 0
-
-        min_pos = int(positions.min().item())
-        max_pos = int(positions.max().item())
-
-        start = self.rope_window_start_pos
-        end = start + self.rope_window_size - 1
-
-        need_rebuild = (
-            self.rope_cos_window is None
-            or self.rope_sin_window is None
-            or self.rope_cos_window.device != device
-            or self.rope_sin_window.device != device
-            or self.rope_cos_window.dtype != dtype
-            or self.rope_sin_window.dtype != dtype
-            or min_pos < start
-            or max_pos > end
-        )
-
-        if need_rebuild:
-            # Center window around max_pos. For decode T=1 this is the token position.
-            new_start = max(0, max_pos - (self.rope_window_size - 1))
-            self._build_rope_window(new_start, device, dtype)
-            start = self.rope_window_start_pos
-
-        # map absolute positions -> window indices
-        idx = (positions - start).to(torch.long)  # (T,)
-        cos = self.rope_cos_window.index_select(2, idx)  # (1,1,T,hd)
-        sin = self.rope_sin_window.index_select(2, idx)
-        return cos, sin
+        # dropout only affects the activations, zeroing out the activations but not the parameters)
+        self.attn_dropout = config.attn_dropout
+        self.resid_dropout = nn.Dropout(config.resid_dropout)  # non-trainable layer
 
     def forward(
         self,
         x: torch.Tensor,
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-        pos_offset: int = 0,
         use_cache: bool = False,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], int]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         B, T, C = x.shape
+        kv_dim = self.n_kv_head * self.head_dim
 
-        head_dim = self.head_dim
-        q_dim = self.n_embd
-        kv_dim = self.n_kv_head * head_dim
-
-        qkv = self.c_attn(x) 
-        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=2)
+        x = self.c_attn(x)
+        q, k, v = x.split([self.n_embd, kv_dim, kv_dim], dim=-1)
         
         # (B, n_head, T, head_size)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        # (B, n_kv_head, T, head_size)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        k = k.view(B, T, self.n_kv_head, head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_head, head_dim).transpose(1, 2)
-
-        # total length = cached + current
         past_len = 0 if past_kv is None else past_kv[0].size(2)
+        total_len = past_len + T
+        assert total_len <= self.block_size, f"context {total_len} exceeds block_size {self.block_size}"
 
-        # build (or rebuild) cache for this sequence length/device/dtype
-        # cache shapes: (1, 1, T, head_dim)
-        if not use_cache:
-            # training/full forward: positions are [0..T-1]
-            cos, sin = self._get_rope_cos_sin(T, x.device, q.dtype)
-            assert cos.device == x.device and sin.device == x.device
-            assert cos.dtype == q.dtype and sin.dtype == q.dtype
-            assert cos.size(-1) == self.head_dim and sin.size(-1) == self.head_dim
-            q = self._apply_rope(q, cos, sin)
-            k = self._apply_rope(k, cos, sin)
-        else:
-            # decoding/KV cache: absolute positions with bounded window
-            positions = torch.arange(
-                pos_offset + past_len,
-                pos_offset + past_len + T,
-                device=x.device,
-                dtype=torch.long,
-            )
-            cos, sin = self._get_rope_cos_sin_bounded(positions, x.device, q.dtype)
-            q = self._apply_rope(q, cos, sin)
-            k = self._apply_rope(k, cos, sin)
+        # Build/get cos/sin for positions [0..total_len-1]
+        cos, sin = self._get_rope_cos_sin(total_len, q.device, q.dtype)  # (1,1,total_len,hd)
+
+        # Apply RoPE to *new* tokens only, using positions [past_len .. total_len-1]
+        cos_q = cos[:, :, past_len:total_len, :]
+        sin_q = sin[:, :, past_len:total_len, :]
+        q = self._apply_rope(q, cos_q, sin_q)
+        k = self._apply_rope(k, cos_q, sin_q)
 
         if past_kv is not None:
             k = torch.cat([past_kv[0], k], dim=2)  # concat on T dimension
             v = torch.cat([past_kv[1], v], dim=2)
 
-        if k.size(2) > self.block_size:
-            drop = k.size(2) - self.block_size
-            k = k[:, :, drop:, :].contiguous()
-            v = v[:, :, drop:, :].contiguous()
-            pos_offset += drop
-
-        present = (k, v)
-        past_len_eff = k.size(2) - T
+        present = (k, v) if use_cache else None
+        past_len_eff = k.size(2) - T  # cached length
+        # other dropouts in nn.Dropout are handled by Pytorch already with self.training checked
+        # do not put in init, since the model will change from train() to eval() etc
         dropout_p = self.attn_dropout if self.training else 0.0
 
         if self.qk_rmsnorm:
             q = self._rms_norm_lastdim(q, self.qk_rmsnorm_eps)
             k = self._rms_norm_lastdim(k, self.qk_rmsnorm_eps)
 
-        k_len = k.size(2)   # S
-        q_len = q.size(2)   # T
+        k_len = k.size(2)  # the whole length
+        q_len = q.size(2)  # the length of this call
 
         attn_mask = None
         is_causal = True
@@ -421,32 +172,162 @@ class CausalSelfAttention(nn.Module):
             is_causal=is_causal,
         )
 
-        # use contiguous before view if it's after transpose() immediately, which is the only use case of contiguous()
+        # use contiguous before view if it's after transpose() immediately, which is the only common use case of contiguous()
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # do a linear before residual to learn the multi-head feature
         y = self.resid_dropout(self.c_proj(y))
 
-        return y, present, pos_offset
+        return y, present
+
+    # use_cache = False for training, and usually T = block_size and is rebuilt only at the first run if no error occurs
+    def _get_rope_cos_sin(self, T: int, device: torch.device, dtype: torch.dtype):
+        assert T <= self.block_size
+        need_rebuild = (
+            self.rope_cos_cached is None  # cache does not exist
+            or self.rope_sin_cached is None
+            or self.rope_cos_cached.size(2) < self.block_size  # cache is too short
+            or self.rope_cos_cached.device != device  # cache is on a different device
+            or self.rope_cos_cached.dtype != dtype  # cache is of a different dtype
+        )
+        
+        # caching the cos, sin tables
+        if need_rebuild:
+            # from 0 to T-1
+            # set device because it is newly initialized
+            # initialize as integers for discrete idx
+            positions = torch.arange(self.block_size, device=device, dtype=torch.long)
+            self.rope_cos_cached, self.rope_sin_cached = self._rope_cos_sin_from_positions(positions, device=device, dtype=dtype)
+
+        return self.rope_cos_cached[:, :, :T, :], self.rope_sin_cached[:, :, :T, :]
+
+    def _rope_cos_sin_from_positions(
+        self,
+        positions: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # initialized as integer, convert to float32 for sensitive calculation
+        # if inference block size > trained block size, rope_scale_factor = inference/trained (larger than 1)
+        # larger rope_scale_factor makes the RoPe more sensible to longer sequence
+        pos = positions.to(device=device, dtype=torch.float32) / self.rope_scale_factor
+
+        # (1, rb^(-2/head_dim), rb^(-4/head_dim), ...)
+        base_angle = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32) / self.head_dim))
+
+        freqs = torch.outer(pos, base_angle)  # (T, head_dim/2)
+
+        # duplicates the frequency for cosine and sine
+        emb = torch.repeat_interleave(freqs, repeats=2, dim=-1)  # (T, head_dim)
+
+        cos = emb.cos()[None, None, :, :].to(dtype=dtype)  # (1,1,T,head_dim)
+        sin = emb.sin()[None, None, :, :].to(dtype=dtype)
+        return cos, sin
+
+    @staticmethod
+    def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """
+        Apply rotary embedding to x.
+        x: (B, nh, T, hs)
+        cos/sin: (1, 1, T, hs)
+        """
+
+        # standard rotation for (a, b)
+        # the return of _apply_rope is same as (a, b) = (acosθ − bsinθ, asinθ + bcosθ)
+        return (x * cos) + (CausalSelfAttention._rotate_half(x) * sin)
+
+    # helper function for _apply_rope
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        # x is a tensor of shape (B, nh, T, hs)
+        # rotation is done on the last dimension (hs)
+
+        # x1 = x[..., ::2] means x1 = x[0], x[2], x[4], ...
+        # x2 = x[..., 1::2] means x2 = x[1], x[3], x[5], ...
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+
+        # input = [10, 11, 20, 21, 30, 31]
+        # output = [-11, 10, -21, 20, -31, 30]
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+    @staticmethod
+    def _rms_norm_lastdim(x: torch.Tensor, eps: float) -> torch.Tensor:
+        # x: (..., head_dim)
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    
+    @staticmethod
+    def _causal_mask_with_past(q_len: int, k_len: int, past_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Returns a boolean mask of shape (q_len, k_len) where True means "masked out".
+        Allows query position i to attend to keys <= past_len + i.
+        """
+        # key positions: 0..k_len-1
+        key_pos = torch.arange(k_len, device=device)  # (k_len,)
+        # query positions in the *full* sequence: past_len..past_len+q_len-1
+        query_pos = past_len + torch.arange(q_len, device=device)  # (q_len,)
+
+        # broadcast: (q_len, k_len)
+        # mask out keys with position > query_pos
+        mask = key_pos[None, :] > query_pos[:, None]
+        return mask
+
+    def _gqa_sdpa_no_repeat(
+        self,
+        q: torch.Tensor,  # (B, n_head, T, hd)
+        k: torch.Tensor,  # (B, n_kv_head, S, hd)
+        v: torch.Tensor,  # (B, n_kv_head, S, hd)
+        attn_mask: torch.Tensor | None,
+        dropout_p: float,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        B, nh, T, hd = q.shape
+        _, nk, S, _ = k.shape
+        assert nh == self.n_head and nk == self.n_kv_head
+        assert nh % nk == 0
+        n_rep = nh // nk
+
+        # (B, nk, n_rep, T, hd)
+        qg = q.view(B, nk, n_rep, T, hd)
+
+        outs = []
+        for g in range(nk):
+            # q: (B, n_rep, T, hd)
+            q_g = qg[:, g, :, :, :]
+            # k,v: (B, 1, S, hd) shared for all reps in this group
+            k_g = k[:, g:g+1, :, :].expand(B, n_rep, S, hd)
+            v_g = v[:, g:g+1, :, :].expand(B, n_rep, S, hd)
+
+            # Broadcast k_g/v_g across heads automatically (1 -> n_rep)
+            out_g = F.scaled_dot_product_attention(
+                q_g, k_g, v_g,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+            )  # (B, n_rep, T, hd)
+            outs.append(out_g)
+
+        # concat group outputs back to (B, n_head, T, hd)
+        y = torch.cat(outs, dim=1)
+        return y
 
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        # Common modern choice is hidden_dim ~= int(8/3 * n_embd) to keep compute similar to 4x GELU MLP
+        # Common modern choice is hidden_dim ~= int(8/3 * n_embd), similar to 4x GELU MLP
         hidden_dim = int((8 * config.n_embd) / 3)
         # make it divisible by 64 for GPU friendliness 
-        hidden_dim = (hidden_dim + 63) // 64 * 64
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = (hidden_dim + 63) // 64 * 64
 
         # fc = fully connected(dense)
-        self.c_fc = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
-
+        # 2 * hidden_dim because of SwiGlu split
+        self.c_fc = nn.Linear(config.n_embd, 2 * self.hidden_dim, bias=config.bias)
+        # sigmoid function
         self.silu = nn.SiLU()
- 
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(getattr(config, "resid_dropout", config.dropout))
+        self.c_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.resid_dropout)
         
     def forward(self, x):
         x = self.c_fc(x)
@@ -464,7 +345,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.ln_1 = RMSNorm(config) # originally layernorm
+        self.ln_1 = RMSNorm(config)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config)
         self.mlp = MLP(config)
@@ -474,16 +355,15 @@ class Block(nn.Module):
         self,
         x: torch.Tensor,
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-        pos_offset: int = 0,
         use_cache: bool = False,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], int]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
 
-        attn_out, present, pos_offset = self.attn(self.ln_1(x), past_kv=past_kv, pos_offset=pos_offset, use_cache=use_cache)
+        attn_out, present = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=use_cache)
 
         # adding x is called residual connection, where x is the residual
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x, present, pos_offset
+        return x, present
 
 
 @dataclass
@@ -510,17 +390,13 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-
         # can use self.config.x for other methods in the same class
         self.config = config
 
         # nn.Embedding is a module that input idx and output embedding without matmul, just simple mapping
         # wte word token embedding
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        emb_p = getattr(config, "emb_dropout", config.dropout)
-        self.dropout = nn.Dropout(emb_p)
+        self.dropout = nn.Dropout(config.emb_dropout)
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
         # last layernorm 
@@ -547,31 +423,13 @@ class GPT(nn.Module):
 
         print(f"number of parameters: {self.get_num_params() / 1e6:.2f}M")
 
-    def get_num_params(self):
-        n_params = sum(p.numel() for p in self.parameters())
-        return n_params
-
-    #start with _ to remind user this function should not be called outside of the class
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            # module.weight/ module.bias = self.weight/self.bias for that module
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
     def forward(
         self,
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         past_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-        pos_offsets: list[int] | None = None,
         use_cache: bool = False,
     ):
-
-        # idx is a tensor which always have the attribute of .device
-        device = idx.device
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # idx must be integer token ids
@@ -584,28 +442,22 @@ class GPT(nn.Module):
         if use_cache:
             if past_kv is None:
                 past_kv = [None] * len(self.h)
-            if pos_offsets is None:
-                pos_offsets = [0] * len(self.h)
 
             presents: list[tuple[torch.Tensor, torch.Tensor]] = []
-            new_offsets: list[int] = []
 
             for i, (block, layer_past) in enumerate(zip(self.h, past_kv)):
-                x, present, new_off = block(
+                x, present = block(
                     x,
                     past_kv=layer_past,
-                    pos_offset=pos_offsets[i],
                     use_cache=True,
                 )
                 presents.append(present)
-                new_offsets.append(new_off)
 
         else:
             # training/full forward: no KV cache bookkeeping
             for block in self.h:
-                x, _, _ = block(x, past_kv=None, pos_offset=0, use_cache=False)
+                x, _ = block(x, past_kv=None, use_cache=False)
             presents = None
-            new_offsets = None
 
         x = self.ln_f(x)
 
@@ -634,19 +486,38 @@ class GPT(nn.Module):
             loss = None
 
         if use_cache:
-            return logits, loss, presents, new_offsets
+            return logits, loss, presents
         return logits, loss
+    
+    def get_num_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        return n_params
+
+    #start with _ to remind user this function should not be called outside of the class
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # module.weight/ module.bias = self.weight/self.bias for that module
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         for block in self.h:
             block.attn.block_size = block_size
-            block.attn.rope_window_size = block_size
         # if manual attn, need to include attn.bias because attn_mask is coded with block_size
         # sdpa with is_casual=True does not depend on block_size
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(
+        self,
+        weight_decay,
+        learning_rate,
+        betas,
+        device_type: str
+    ) -> torch.optim.Optimizer:
         # decay_params for weights but not bias 
         # weight decay is L2 regularization, discouraging large weight values
         decay_params = [p for pn, p in self.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -711,16 +582,20 @@ class GPT(nn.Module):
         B, T = idx.size()
         device = idx.device
         past_kv = None
-        pos_offsets = None
         # finished is a boolean tensor of shape (B, )
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         # eos is a single number tensor, eos_token_id is an int
         # create eos for torch.where()
         eos = torch.tensor(eos_token_id, device=device, dtype=idx.dtype) if eos_token_id is not None else None
+        if idx.size(1) > self.config.block_size:
+            raise ValueError("Prompt exceeds block_size")
 
         for step in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:] if past_kv is None else idx[:, -1:]
-            logits, _, past_kv, pos_offsets = self(idx_cond, past_kv=past_kv, pos_offsets=pos_offsets, use_cache=True)
+            if idx.size(1) >= self.config.block_size:
+                raise ValueError("Prompt exceeds block_size")
+
+            idx_cond = idx if past_kv is None else idx[:, -1:]
+            logits, _, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
 
             # get the last token
             logits = logits[:, -1, :]  # (B, vocab)
@@ -803,7 +678,7 @@ class GPT(nn.Module):
                 # look at the whole batch
                 seq = idx[b]
                 # .nonzero() returns the indices of non-zero values 
-                eos_pos = (seq == eos_token_id).nonzero(as_tuple=False)
+                eos_pos = (seq == eos_token_id).nonzero(as_tuple=False)  # (N, 1)
                 if eos_pos.numel() > 0:
                     cut = int(eos_pos[0].item())
                     seq = seq[:cut]
@@ -834,4 +709,4 @@ class GPT(nn.Module):
 
         if return_lengths:
             return idx, lengths
-        return idx
+        return idx, None

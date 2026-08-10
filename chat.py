@@ -13,6 +13,8 @@ import tiktoken
 from model import GPTConfig, GPT
 
 
+exec(open('configurator.py').read()) # overrides from command line or config file
+
 # ----------------------------- Defaults -----------------------------
 
 @dataclass
