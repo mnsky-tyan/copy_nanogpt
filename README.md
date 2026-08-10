@@ -12,15 +12,10 @@ I’m grateful to Karpathy for making NanoGPT available and easy to learn from.
 
 ## What this repo is
 
-- A personal fork / study implementation based on NanoGPT
+- A personal fork and study implementation based on NanoGPT
 - Extra comments and small refactors to improve readability
 - Experimental improvements (newer techniques compared to GPT‑2 baseline), as I learn
-
-## What this repo is not
-
-- Not an official NanoGPT fork
-- Not guaranteed to be production-ready or stable
-- Not intended as a drop-in replacement for NanoGPT
+- Currently study on model.py is finished, and train.py is much difficult that i do not very familiar with
 
 ## How to run
 
